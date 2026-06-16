@@ -42,11 +42,14 @@ class EmbeddingClient:
         # SDK 默认 read=600s + max_retries=2，会和外层 with_retry 串成天文超时；
         # 这里压到 timeout=embedding_call_timeout_s + max_retries=0，由外层兜底。
         t = settings.embedding_call_timeout_s
-        self._client = AsyncArk(
+        kwargs = dict(
             api_key=settings.ark_api_key,
             timeout=httpx.Timeout(t, connect=5.0),
             max_retries=0,
         )
+        if settings.ark_base_url:
+            kwargs["base_url"] = settings.ark_base_url
+        self._client = AsyncArk(**kwargs)
         # 使用豆包 Embedding Vision 模型，支持文本和图像嵌入（当前仅使用文本功能）
         self._model = "doubao-embedding-vision-251215"
 

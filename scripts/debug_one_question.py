@@ -126,7 +126,7 @@ async def main() -> None:
             elif role == "assistant":
                 await pipeline.ingest(content, event_time=event_time, role="assistant")
 
-    ref_time = _max_haystack_time(dates)
+    ref_time = _parse_lme_date(entry.get("question_date")) or _max_haystack_time(dates)
     logger.info("ingest done. answering with debug → %s", out_path)
     hypothesis = await pipeline.answer(
         entry["question"],

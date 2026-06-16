@@ -171,7 +171,8 @@ class LLMClient:
     # 根据记忆上下文回答问题
     async def generate_answer(
         self, query: str, context: str,
-        *, debug: DebugCollector | None = None,
+        *, reference_time: str | None = None,
+        debug: DebugCollector | None = None,
     ) -> dict:
         """
         基于检索到的记忆上下文回答问题。
@@ -179,11 +180,13 @@ class LLMClient:
         Args:
             query: 用户问题。
             context: 来自 CBA 构建的检索上下文（含事实和最近对话）。
+            reference_time: 参考时间（ISO格式），时间推理类问题以此作为"当前时刻"。
 
         Returns:
             包含 answer、confidence、reasoning 的字典。
         """
-        user_message = f"问题：{query}\n\n记忆上下文：\n{context}"
+        ref_line = f"\n参考时间（当前时刻）：{reference_time}\n" if reference_time else ""
+        user_message = f"问题：{query}\n\n记忆上下文：\n{context}{ref_line}"
         response = await self.generate(prompts.ANSWER_SYNTHESIS_SYSTEM, user_message)
         parsed = self._parse_json(response)
         if debug is not None:

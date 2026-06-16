@@ -214,7 +214,7 @@ async def main() -> None:
                     elif role == "assistant":
                         await pipeline.ingest(content, event_time=event_time, role="assistant")
 
-            ref_time = _max_haystack_time(dates)
+            ref_time = _parse_lme_date(entry.get("question_date")) or _max_haystack_time(dates)
             hypothesis = await pipeline.answer(entry["question"], reference_time=ref_time)
 
             await write_result({"question_id": qid, "hypothesis": hypothesis})

@@ -144,7 +144,9 @@ class MemoryRetrievalPipeline:
         # 6) LLM 合成答案
         try:
             answer_result = await self.container.llm.generate_answer(
-                query, context, debug=debug,
+                query, context,
+                reference_time=reference_time.isoformat() if reference_time else None,
+                debug=debug,
             )
             answer_text = answer_result.get("answer", "信息不足，无法回答。")
         except Exception as e:

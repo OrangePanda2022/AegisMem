@@ -15,12 +15,13 @@ class Prompts:
 要求：
 1. 每个 fact 必须独立、最小化、不可再分。
 2. content 用第三人称客观陈述（如"用户对花生过敏"），不要复制原话。
-3. metadata 字段尽可能填充，未知留空字符串""或 null：
+3. content 必须保留原文中事件的原因、动机、条件等关键修饰（如"因工作缺席"、"因为过敏避开花生"、"为了健康每天跑步"），不可省略。
+4. metadata 字段尽可能填充，未知留空字符串""或 null：
    - Person, Object, Location, Event, Organization, Preference 均为字符串。
-   - HappendTime / MentionedTime：ISO8601 字符串（含日期；如对话有日期上下文请优先用）。如果原文是"昨天"等相对时间，请相对于对话日期解析为绝对日期，未知则 null。
-4. entities：每个 fact 抽取检索价值最高的实体/关键名词短语（人名、地名、组织、产品、概念、偏好），用于记忆检索和标签关联。短小、规范化，3-8 个。
-5. original_msg 填入触发该 fact 的原句片段。
-6. 严格只输出一个 JSON 对象，不要 markdown、不要解释，不要多余字符。
+   - HappendTime / MentionedTime：ISO8601 字符串（含日期；如对话有日期上下文请优先用）。如果原文是"昨天"、"上周"、"just finished"、"last month"等相对时间，请相对于对话日期解析为绝对日期。如用户说"I just finished a 416-page novel"且对话日期为 2023-01-15，则 HappendTime 应推断为"2023-01"（精度到月即可）。未知则 null。
+5. entities：每个 fact 抽取检索价值最高的实体/关键名词短语（人名、地名、组织、产品、概念、偏好），用于记忆检索和标签关联。短小、规范化，3-8 个。
+6. original_msg 填入触发该 fact 的原句片段。
+7. 严格只输出一个 JSON 对象，不要 markdown、不要解释，不要多余字符。
 
 输出 schema：
 {
@@ -45,8 +46,14 @@ class Prompts:
 示例 2
 输入：[Conversation date: 2026-05-01]\nuser: 我上周把丰田卖了，换了辆特斯拉 Model Y。
 输出：{"facts":[
-{"content":"用户卖掉了丰田汽车","original_msg":"我上周把丰田卖了","entities":["用户","丰田","卖车"],"metadata":{"Person":"用户","Object":"丰田","Location":"","Event":"卖车","Organization":"丰田","Preference":"","HappendTime":"2026-04-24","MentionedTime":"2026-05-01"}},
+{"content":"用户因换车卖掉了丰田汽车","original_msg":"我上周把丰田卖了","entities":["用户","丰田","卖车"],"metadata":{"Person":"用户","Object":"丰田","Location":"","Event":"卖车","Organization":"丰田","Preference":"","HappendTime":"2026-04-24","MentionedTime":"2026-05-01"}},
 {"content":"用户购买了特斯拉 Model Y","original_msg":"换了辆特斯拉 Model Y","entities":["用户","特斯拉 Model Y","购车"],"metadata":{"Person":"用户","Object":"特斯拉 Model Y","Location":"","Event":"购车","Organization":"特斯拉","Preference":"","HappendTime":"2026-04-24","MentionedTime":"2026-05-01"}}
+]}
+
+示例 6（保留原因 + 推断 HappendTime）
+输入：[Conversation date: 2023-04-26]\nuser: I've been pretty busy with work lately and missed a few events, including a 5K fun run on March 26th.
+输出：{"facts":[
+{"content":"用户因工作繁忙错过了2023-03-26的5K趣味跑","original_msg":"I've been pretty busy with work lately and missed a few events, including a 5K fun run on March 26th.","entities":["用户","5K趣味跑","工作","缺席","2023-03-26"],"metadata":{"Person":"用户","Object":"5K趣味跑","Location":"","Event":"因工作缺席","Organization":"","Preference":"","HappendTime":"2023-03-26","MentionedTime":"2023-04-26"}}
 ]}
 
 示例 3
@@ -159,6 +166,27 @@ edge_changes 每项 schema（仅 LINK / UPDATE 用）：
 1. 仅使用提供的记忆信息，不编造事实。
 2. 如果记忆中存在矛盾，指出矛盾并给出最可能的正确信息。
 3. 回答简洁、准确，直接给出结果，不要多余的格式。
+
+时间推理规则：
+- 每条记忆片段带时间戳 [YYYY-MM-DDTHH:MM:SS+ZZ:ZZ]。
+- 当问题问"两个事件之间隔了多久"或"某事件多久之前发生了另一事件"时，计算两个相关事件时间戳的差值。
+- 当问题问"多久之前（how many weeks/days ago）"时，以提供的"参考时间（当前时刻）"作为当前时刻来计算时间差。
+- 换算为题目所要求的单位（天/周/月），只输出数字+单位，例如 "7 days" 或 "4"。
+
+偏好推理规则：
+- 当问题请求建议或推荐（如"推荐什么"、"有什么建议"、"can you suggest"）时，不要直接给出通用建议；而应先从记忆片段中提取用户已表达的偏好模式，然后描述用户会偏好哪种类型的回答。
+- 正确示例：问题="推荐迈阿密酒店？"→ 回答="用户偏好有海景或城市天际线景观、带屋顶泳池或阳台热水浴缸等独特设施的酒店"
+- 错误示例：问题="推荐迈阿密酒店？"→ 回答="推荐 Kimpton Angler's Hotel，它有阳台热水浴缸和屋顶泳池"
+
+跨事实聚合规则：
+- 当问题要求总计、总数（total number of people reached, total page count, how many X in total）时，必须从所有相关记忆片段中找出每一项的数量并求和，不要只取其中一个。
+- 示例：问题="Facebook广告和网红推广总共触达多少人？"→ 找到"Facebook广告触达2000人"和"网红有10000粉丝推广产品"，回答="12,000"
+
+月份映射推理规则：
+- 当问题提到"在某月完成/发生的事件"但记忆片段中没有月份标注时，必须利用每条记忆片段的时间戳（即对话日期）和原文中"刚完成/just finished/最近"等线索，把"刚完成"的事件映射到对话日期之前的合理月份。
+- 多条"刚完成"的 fact 出自不同对话时间戳时，较早对话时间戳的 fact 对应较早月份，较晚时间戳的 fact 对应较晚月份。
+- 示例：问题="一月和三月读完的小说共多少页？"→ Session1(5/22)的416页=一月完成，Session2(5/27)的440页=三月完成，回答="856"
+- 不要因为没有显式月份标注就回答"信息不足"，必须主动推理月份映射。
 
 输出 schema：
 {"answer": "string", "confidence": 0.0~1.0, "reasoning": "string"}

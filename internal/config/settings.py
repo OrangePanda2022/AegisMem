@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # ---- LLM API 密钥与模型配置 ----
     # 通过 .env 或环境变量注入；默认空字符串避免源码携带凭证。
     ark_api_key: str = ""
+    ark_base_url: str = ""
     deepseek_api_key: str = ""
     deepseek_base_url: str = ""
     deepseek_model: str = ""
