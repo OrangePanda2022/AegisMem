@@ -107,9 +107,46 @@ class RecallService:
                 result.facts.append(f)
                 result.source_scores[str(f.id)] = 0.5  # 中性默认分
 
-        # 2) 关键字召回
-        keyword_result = await self._keyword_recall(query, query_embedding, debug=debug)
-        result.merge(keyword_result)
+        # 2) 关键字召回（或投机召回）
+        if settings.speculative_retrieval_enabled:
+            # [方案B] Draft-then-Verify：先跑向量一路，检查充分性
+            draft_result = await self._draft_recall(query_embedding, debug=debug)
+            if draft_result.facts:
+                draft_summary_parts = [
+                    f"- {f.content[:100]}" for f in draft_result.facts[:5]
+                ]
+                draft_summary = "\n".join(draft_summary_parts)
+                try:
+                    suff = await self.c.llm.check_sufficiency(query, draft_summary)
+                    if (suff.get("sufficient", False)
+                            and suff.get("confidence", 0) >= settings.speculative_confidence_threshold):
+                        logger.info("Speculative retrieval: draft sufficient (conf=%.2f)",
+                                     suff.get("confidence", 0))
+                        result.merge(draft_result)
+                        # 跳过完整 4-path，直接进图游走
+                        if result.facts:
+                            walk_result = await self._graph_walk(result.facts, query_embedding, debug=debug)
+                            for f in walk_result:
+                                if str(f.id) not in result.source_scores:
+                                    result.facts.append(f)
+                                    result.source_scores[str(f.id)] = 0.1
+                                    result.expanded_facts.append(f)
+                        result = await self._resolve_contradictions(result, debug=debug)
+                        if debug is not None:
+                            debug.record("speculative_recall", {
+                                "draft_sufficient": True,
+                                "confidence": suff.get("confidence", 0),
+                            })
+                        return result
+                except Exception as e:
+                    logger.warning("Speculative sufficiency check failed: %s", e)
+
+            # Draft 不充分，回退到完整 4-path
+            keyword_result = await self._keyword_recall(query, query_embedding, debug=debug)
+            result.merge(keyword_result)
+        else:
+            keyword_result = await self._keyword_recall(query, query_embedding, debug=debug)
+            result.merge(keyword_result)
 
         # 3) 图随机游走（以种子 Fact 为起点）
         if result.facts:
@@ -136,15 +173,19 @@ class RecallService:
 
     async def _keyword_recall(
         self, query: str, query_embedding: list[float],
-        *, debug: DebugCollector | None = None,
+        *, pre_extracted_entities: list[str] | None = None,
+        debug: DebugCollector | None = None,
     ) -> RecallResult:
-        # 1) LLM 提取关键词
+        # 1) LLM 提取关键词（或使用预提取的关键词）
         fallback_used = False
-        try:
-            keywords = await self.c.llm.extract_entities(query)
-        except Exception as e:
-            logger.warning("extract_entities failed: %s", e)
-            keywords = []
+        if pre_extracted_entities is not None:
+            keywords = list(pre_extracted_entities)
+        else:
+            try:
+                keywords = await self.c.llm.extract_entities(query)
+            except Exception as e:
+                logger.warning("extract_entities failed: %s", e)
+                keywords = []
 
         if not keywords:
             keywords = [query[:20]]
@@ -155,6 +196,37 @@ class RecallService:
                 "raw": list(keywords),
                 "fallback_used": fallback_used,
             })
+
+        # P1: KB-aware 关键词映射 — 用 KB 中实际存在的实体替换原始关键词
+        # 避免搜索 KB 中不存在的实体词（如 "5-day trip" vs KB 中的 "Costa Rica"）
+        mapped_keywords: list[str] = []
+        seen_mapped: set[str] = set()
+        if keywords:
+            try:
+                kb_entities = await self.c.entities.hybrid_recall(
+                    keywords, query_embedding, top_k=10
+                )
+                kb_names = {e.name for e in kb_entities}
+                # 优先用 KB 实体名替换；对原始关键词，如果 KB 中有匹配则保留原词，否则丢弃
+                for kw in keywords:
+                    kw_lower = kw.lower()
+                    # 关键词在 KB 中有近似匹配 → 保留
+                    matched = any(kw_lower in n.lower() or n.lower() in kw_lower for n in kb_names)
+                    if matched:
+                        if kw_lower not in seen_mapped:
+                            mapped_keywords.append(kw)
+                            seen_mapped.add(kw_lower)
+                    # 否则用 top KB 实体补充
+                for e in kb_entities[:5]:
+                    n_lower = e.name.lower()
+                    if n_lower not in seen_mapped:
+                        mapped_keywords.append(e.name)
+                        seen_mapped.add(n_lower)
+                if mapped_keywords:
+                    logger.info("KB keyword mapping: %s → %s", keywords[:8], mapped_keywords[:8])
+                    keywords = mapped_keywords
+            except Exception as e:
+                logger.warning("KB keyword mapping failed, using raw keywords: %s", e)
 
         # 2) Entity hybrid_recall（Trigram + Embedding + RRF）
         top_k_entity = settings.retrieve_top_k_entity
@@ -289,7 +361,160 @@ class RecallService:
 
         return result
 
-    # ---------- 图随机游走 ----------
+    # ---------- 迭代召回（方案A：查询扩展） ----------
+
+    async def recall_by_keywords(
+        self,
+        keywords: list[str],
+        query_embedding: list[float],
+        existing_fact_ids: set[str] | None = None,
+        *,
+        debug: DebugCollector | None = None,
+    ) -> RecallResult:
+        """用扩展关键词执行定向召回（用于迭代检索第二轮）。
+
+        跳过 LLM 实体抽取（关键词即实体），跑 _keyword_recall + 图游走。
+        过滤掉已召回的事实，仅返回新增事实。
+
+        Args:
+            keywords: 充分性检查生成的替代搜索关键词。
+            query_embedding: 原始查询向量（用于向量搜索 + 图游走）。
+            existing_fact_ids: 已召回事实 ID 集合（用于去重）。
+        """
+        keyword_result = await self._keyword_recall(
+            "iterative_query", query_embedding,
+            pre_extracted_entities=keywords, debug=debug,
+        )
+
+        # 过滤已存在的 facts
+        if existing_fact_ids:
+            keyword_result.facts = [
+                f for f in keyword_result.facts
+                if str(f.id) not in existing_fact_ids
+            ]
+            keyword_result.source_scores = {
+                k: v for k, v in keyword_result.source_scores.items()
+                if k not in existing_fact_ids
+            }
+
+        # 图游走扩展新发现的 seed facts
+        if keyword_result.facts:
+            walk_result = await self._graph_walk(
+                keyword_result.facts, query_embedding, debug=debug,
+            )
+            existing = existing_fact_ids or set()
+            for f in walk_result:
+                fid = str(f.id)
+                if fid not in existing and fid not in keyword_result.source_scores:
+                    keyword_result.facts.append(f)
+                    keyword_result.source_scores[fid] = 0.1
+                    keyword_result.expanded_facts.append(f)
+
+        if debug is not None:
+            debug.record("iterative_recall", {
+                "keywords": keywords,
+                "new_facts_count": len(keyword_result.facts),
+                "expanded_count": len(keyword_result.expanded_facts),
+            })
+
+        return keyword_result
+
+    async def expand_keywords_via_graph(
+        self,
+        seed_facts: list[Fact],
+        *,
+        top_n_facts: int = 5,
+        top_n_neighbors_per_fact: int = 3,
+        debug: DebugCollector | None = None,
+    ) -> list[str]:
+        """从 seed facts 出发，沿 edges 找邻居 fact，提取其 tag 实体名作为扩展关键词。
+
+        用于 alt_keywords 补充：LLM 推断的 alt_keywords 常是抽象主题词，
+        无法命中用户实际提过的具体品牌/型号；从 graph 邻居 fact 的 tag
+        实体中取具体名词，可补足这部分。
+        """
+        if not seed_facts:
+            return []
+
+        seen_entity_names: set[str] = set()
+        neighbor_entity_names: list[str] = []
+
+        for fact in seed_facts[:top_n_facts]:
+            try:
+                neighbors = await self.c.edges.find_top_neighbors(
+                    fact.id, top_n=top_n_neighbors_per_fact,
+                )
+            except Exception as e:
+                logger.warning("expand_keywords_via_graph: find_top_neighbors failed for %s: %s", fact.id, e)
+                continue
+            for edge in neighbors:
+                nid = (str(edge.to_fact_id)
+                       if str(edge.from_fact_id) == str(fact.id)
+                       else str(edge.from_fact_id))
+                try:
+                    nbr = await self.c.facts.get_by_id(UUID(nid))
+                except Exception:
+                    nbr = None
+                if nbr is None:
+                    continue
+                # 从 neighbor fact 的 tag 提取实体名
+                for tag in nbr.tag[:3]:
+                    name = (tag.Entity.name or "").strip()
+                    if not name:
+                        continue
+                    key = name.lower()
+                    if key in seen_entity_names:
+                        continue
+                    seen_entity_names.add(key)
+                    neighbor_entity_names.append(name)
+
+        if debug is not None:
+            debug.record("expand_keywords_via_graph", {
+                "seed_count": len(seed_facts[:top_n_facts]),
+                "expanded_keywords": neighbor_entity_names,
+                "count": len(neighbor_entity_names),
+            })
+
+        return neighbor_entity_names
+
+    # ---------- 投机召回（方案B：Draft-then-Verify） ----------
+
+    async def _draft_recall(
+        self, query_embedding: list[float],
+        *, debug: DebugCollector | None = None,
+    ) -> RecallResult:
+        """仅跑向量搜索一路作为 draft，跳过实体抽取和其他三路。"""
+        vec_facts = await self.c.facts.vector_search_with_scores(
+            query_embedding, top_k=settings.retrieve_top_k_fact_vec,
+        )
+
+        vec_raw: dict[str, float] = {}
+        id_to_fact: dict[str, Fact] = {}
+        for f, s in vec_facts:
+            fid = str(f.id)
+            id_to_fact[fid] = f
+            vec_raw[fid] = s
+
+        vec_n = _normalize(vec_raw)
+
+        result = RecallResult()
+        for fid, score_n in vec_n.items():
+            fact = id_to_fact.get(fid)
+            if fact:
+                result.facts.append(fact)
+                result.source_scores[fid] = score_n
+        result.seed_facts = list(result.facts)
+
+        if debug is not None:
+            debug.record("draft_recall", {
+                "facts_count": len(result.facts),
+                "top": [
+                    {"id": fid, "content": (id_to_fact[fid].content or "")[:80], "vec_n": float(score_n)}
+                    for fid, score_n in sorted(vec_n.items(), key=lambda kv: kv[1], reverse=True)[:10]
+                ],
+            })
+
+        return result
 
     async def _graph_walk(
         self,
@@ -480,6 +705,9 @@ class RecallService:
 
         # ---- 记忆项 R(u,t) ----
         ref_time = fact_u.last_accessed_at or fact_u.created_at
+        if ref_time and ref_time.tzinfo is None:
+            # DB 中存的 naive datetime 视为 UTC
+            ref_time = ref_time.replace(tzinfo=timezone.utc)
         if ref_time:
             delta_days = (current_time - ref_time).total_seconds() / 86400.0
         else:

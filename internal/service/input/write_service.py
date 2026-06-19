@@ -88,11 +88,16 @@ class WriteService:
         if event_time and meta.MentionedTime is None:
             meta.MentionedTime = event_time
 
+        # P0: 回填 HappendTime — 当 HappendTime 为空但有 MentionedTime 时，
+        # 将 MentionedTime 近似作为 HappendTime（事件时间信号的兜底）
+        if meta.HappendTime is None and meta.MentionedTime is not None:
+            meta.HappendTime = meta.MentionedTime
+
         # 1) Fact embedding
         embedding = await self.c.embedder.embed_text(content)
 
         # 2) Tag 填充：用 fact 提取时已获得的 entities 跳过 LLM 调用
-        tags = await self._build_tags(content, pre_extracted_entities)
+        tags = await self._build_tags(content, pre_extracted_entities, fact_embedding=embedding)
 
         # 3) 三层 Fact 召回：vector ∪ tag-filter ∪ recency
         candidates = await self._three_stage_recall(content, embedding, tags)
@@ -152,7 +157,7 @@ class WriteService:
 
     # ---------- 内部组件 ----------
 
-    async def _build_tags(self, content: str, pre_extracted_entities: list[str] | None = None) -> list[Tag]:
+    async def _build_tags(self, content: str, pre_extracted_entities: list[str] | None = None, *, fact_embedding: list[float] | None = None) -> list[Tag]:
         if pre_extracted_entities:
             keywords = pre_extracted_entities
         else:
@@ -162,18 +167,24 @@ class WriteService:
         # 对每个 keyword 做 hybrid recall；候选并集后让 LLM 取舍是另一次 LLM 调用，
         # 这里为节流采用启发式：直接复用 hybrid 召回 top-3 作为已有，
         # 未命中的关键词作为新 Entity 创建，全部权重默认 1.0（后续 evolution 可调整）。
-        query_emb = await self.c.embedder.embed_text(content)
+        query_emb = fact_embedding if fact_embedding is not None else await self.c.embedder.embed_text(content)
         recalled = await self.c.entities.hybrid_recall(keywords, query_emb, top_k=10)
         recalled_names = {e.name for e in recalled}
         tags: list[Tag] = []
+        # 先收集需新建的 keyword，批量嵌入
+        new_keywords = [kw for kw in keywords if kw not in recalled_names]
+        new_embs: dict[str, list[float]] = {}
+        if new_keywords:
+            batch = await self.c.embedder.embed_texts(new_keywords)
+            for kw, emb in zip(new_keywords, batch):
+                new_embs[kw] = emb
         for kw in keywords:
             existing = next((e for e in recalled if e.name == kw), None)
             if existing is None and kw in recalled_names:
                 existing = next(e for e in recalled if e.name == kw)
             if existing is None:
-                # 新建
-                emb = await self.c.embedder.embed_text(kw)
-                ent = Entity(name=kw, embedding=emb)
+                # 新建，用预计算的批量 embedding
+                ent = Entity(name=kw, embedding=new_embs[kw])
                 await self.c.entities.add(ent)
                 tags.append(Tag(Entity=ent, Weight=1.0))
             else:

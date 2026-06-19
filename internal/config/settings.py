@@ -13,26 +13,27 @@ class Settings(BaseSettings):
 
     # ---- LLM API 密钥与模型配置 ----
     # 通过 .env 或环境变量注入；默认空字符串避免源码携带凭证。
-    ark_api_key: str = ""
-    ark_base_url: str = ""
-    deepseek_api_key: str = ""
-    deepseek_base_url: str = ""
-    deepseek_model: str = ""
+    llm_api_key: str = ""
+    llm_base_url: str = ""
+    llm_model: str = ""
 
     # ---- Judge LLM ----
     judge_api_key: str = ""
     judge_base_url: str = ""
     judge_model: str = ""
 
-    # ---- 嵌入向量维度 ----
+    # ---- Embedding 模型 ----
+    embedding_api_key: str = ""
+    embedding_base_url: str = ""
+    embedding_model: str = ""
     embedding_dim: int = 2048
 
     # ---- 外部 API 并发与重试 ----
-    # 客户端层全局信号量限流，避免大并发评测撞 DeepSeek/Ark 限速。
-    llm_max_concurrency: int = 8
+    # 客户端层全局信号量限流，避免大并发评测撞限速。
+    llm_max_concurrency: int = 48
     embedding_max_concurrency: int = 16
-    api_max_retries: int = 3
-    api_retry_base_delay: float = 1.0  # 指数退避基数（秒）
+    api_max_retries: int = 8
+    api_retry_base_delay: float = 2.0  # 指数退避基数（秒），8次重试最大延迟~256s，足以跨过RPM窗口
     # 单次调用硬超时（秒）。两层兜底：
     #   1. SDK 层 httpx timeout（连接/读取/写入），由 socket close 强制中断
     #   2. with_retry 外层 asyncio.wait_for（防止 SDK timeout 在某些网关下不触发）
@@ -55,7 +56,7 @@ class Settings(BaseSettings):
     retrieve_top_k_entity: int = 20
     retrieve_top_k_fact_vec: int = 10
     retrieve_top_k_fact_tag: int = 20
-    retrieve_max_graph_depth: int = 2
+    retrieve_max_graph_depth: int = 4
     retrieve_graph_walk_threshold: float = 0.01
     retrieve_lambda_sem: float = 1.0
     retrieve_lambda_mem: float = 0.5
@@ -63,7 +64,7 @@ class Settings(BaseSettings):
     retrieve_alpha: float = 0.3
     retrieve_tau_days: int = 365
     retrieve_eta: float = 0.5
-    retrieve_total_token_budget: int = 4000
+    retrieve_total_token_budget: int = 6000
 
     # ---- Fact 召回 4 路加权融合（BM25 + Trigram + Vec + Tag）----
     retrieve_top_k_fact_bm25: int = 20
@@ -74,13 +75,28 @@ class Settings(BaseSettings):
     retrieve_lambda_trigram: float = 0.2
 
     # ---- MASManager 多智能体系统权重 ----
+    # tier_boost 调低（0.15→0.05），semantic_match 提高（0.35→0.45）：
+    # 防止 L0/L1 fact 仅靠访问频次把语义相关度更高的 L3 fact 压低
+    # 详见 SSP debug 分析：09d032c9/95228167/38146c39 三题因此错
     mas_weights: dict = {
-        "semantic_match": 0.35,
+        "semantic_match": 0.45,
         "edge_weight": 0.20,
         "recency": 0.15,
-        "tier_boost": 0.15,
+        "tier_boost": 0.05,
         "activation_history": 0.15,
     }
+
+    # ---- Iterative retrieval (sufficiency-check + query-expansion) ----
+    iterative_retrieval_enabled: bool = True
+    iterative_retrieval_max_rounds: int = 3
+
+    # ---- Multi-agent debate mode ----
+    debate_mode_enabled: bool = False
+    debate_mode_specialists: int = 3
+
+    # ---- Speculative retrieval (draft-then-verify) ----
+    speculative_retrieval_enabled: bool = True
+    speculative_confidence_threshold: float = 0.8
 
 
 # 全局单例配置实例，供各模块直接导入使用

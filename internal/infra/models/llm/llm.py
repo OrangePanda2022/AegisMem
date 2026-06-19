@@ -38,8 +38,8 @@ class LLMClient:
         # max_retries=0：避免 SDK 内部还做指数退避（我们外层 with_retry 已经做了）。
         t = settings.llm_call_timeout_s
         self._client = AsyncOpenAI(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
             timeout=httpx.Timeout(t, connect=5.0),
             max_retries=0,
         )
@@ -59,13 +59,13 @@ class LLMClient:
         Returns:
             LLM 生成的文本内容。如果响应中没有文本块，则返回空字符串。
         """
-        logger.debug("LLM call: model=%s system='%s...' user='%s...'", settings.deepseek_model, system_prompt[:60], user_message[:100])
+        logger.debug("LLM call: model=%s system='%s...' user='%s...'", settings.llm_model, system_prompt[:60], user_message[:100])
         sem = get_semaphore("llm", settings.llm_max_concurrency)
 
         async def _call():
             async with sem:
                 return await self._client.chat.completions.create(
-                    model=settings.deepseek_model,
+                    model=settings.llm_model,
                     max_tokens=max_tokens,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -185,8 +185,10 @@ class LLMClient:
         Returns:
             包含 answer、confidence、reasoning 的字典。
         """
+        # 语言提示：根据问题语言决定输出语言，避免中文上下文导致英文问题输出中文
+        lang_hint = "IMPORTANT: Write your answer in English." if all(ord(c) < 0x4e00 for c in query[:50]) else ""
         ref_line = f"\n参考时间（当前时刻）：{reference_time}\n" if reference_time else ""
-        user_message = f"问题：{query}\n\n记忆上下文：\n{context}{ref_line}"
+        user_message = f"问题：{query}\n\n记忆上下文：\n{context}{ref_line}\n\n{lang_hint}"
         response = await self.generate(prompts.ANSWER_SYNTHESIS_SYSTEM, user_message)
         parsed = self._parse_json(response)
         if debug is not None:
@@ -195,6 +197,136 @@ class LLMClient:
                 "user_message": user_message,
                 "raw_response": response,
                 "parsed": parsed,
+            })
+        return parsed
+
+    # 充分性检查
+    async def check_sufficiency(
+        self, query: str, context_summary: str,
+        *, debug: DebugCollector | None = None,
+    ) -> dict:
+        """检查当前召回的上下文是否足以回答问题。
+
+        Args:
+            query: 用户问题。
+            context_summary: 已召回事实的紧凑摘要。
+
+        Returns:
+            包含 sufficient、confidence、reasoning、alternative_keywords 的字典。
+        """
+        user_message = json.dumps({
+            "query": query,
+            "retrieved_context_summary": context_summary,
+        }, ensure_ascii=False)
+        response = await self.generate(
+            prompts.SUFFICIENCY_CHECK_SYSTEM, user_message, max_tokens=512,
+        )
+        parsed = self._parse_json(response)
+        if debug is not None:
+            debug.record("sufficiency_check", {
+                "user_message": user_message,
+                "raw_response": response,
+                "parsed": parsed,
+            })
+        return parsed
+
+    # 反向实体过滤：从 query 推断"完整答案应当引用的具体实体"，检查 top-N 召回是否包含
+    async def extract_expected_entities(
+        self, query: str, top_facts_summary: str,
+        *, debug: DebugCollector | None = None,
+    ) -> dict:
+        """抽取问题预期需要引用的具体实体，并标记 top 召回中缺失的实体。
+
+        Args:
+            query: 用户问题。
+            top_facts_summary: top-N MAS facts 的紧凑摘要。
+
+        Returns:
+            {"expected_entities": [...], "missing_in_top": [...]}
+        """
+        user_message = json.dumps({
+            "query": query,
+            "top_retrieved_facts": top_facts_summary,
+        }, ensure_ascii=False)
+        response = await self.generate(
+            prompts.EXPECTED_ENTITY_SYSTEM, user_message, max_tokens=512,
+        )
+        parsed = self._parse_json(response)
+        if debug is not None:
+            debug.record("expected_entities", {
+                "user_message": user_message,
+                "raw_response": response,
+                "parsed": parsed,
+            })
+        return parsed
+
+    # 多智能体辩论回答
+    async def debate_answer(
+        self, query: str, context: str,
+        *, reference_time: str | None = None,
+        debug: DebugCollector | None = None,
+    ) -> dict:
+        """多专家视角回答 + Judge 合并。
+
+        并行调用 3 个 specialist（preference / factual / temporal），
+        再由 judge 综合输出最终答案。
+
+        Args:
+            query: 用户问题。
+            context: 来自 CBA 的检索上下文。
+            reference_time: 参考时间（ISO格式）。
+
+        Returns:
+            包含 answer、confidence、reasoning 的字典。
+        """
+        import asyncio
+
+        lang_hint = "IMPORTANT: Write your answer in English." if all(ord(c) < 0x4e00 for c in query[:50]) else ""
+        ref_line = f"\n参考时间（当前时刻）：{reference_time}\n" if reference_time else ""
+        user_message = f"问题：{query}\n\n记忆上下文：\n{context}{ref_line}\n\n{lang_hint}"
+
+        specialist_prompts = [
+            prompts.PREFERENCE_SUMMARIZER_SYSTEM,
+            prompts.FACTUAL_RECALLER_SYSTEM,
+            prompts.TEMPORAL_REASONER_SYSTEM,
+        ]
+
+        # 并行调用 specialist
+        specialist_tasks = [
+            self.generate(sp, user_message)
+            for sp in specialist_prompts
+        ]
+        specialist_responses = await asyncio.gather(*specialist_tasks, return_exceptions=True)
+
+        specialist_answers = []
+        for i, resp in enumerate(specialist_responses):
+            if isinstance(resp, Exception):
+                logger.warning("Specialist %d failed: %s", i, resp)
+                specialist_answers.append({"answer": "", "confidence": 0.0, "reasoning": f"specialist {i} failed"})
+            else:
+                specialist_answers.append(self._parse_json(resp))
+
+        # Judge 合并
+        judge_input = json.dumps({
+            "query": query,
+            "specialist_answers": [
+                {"role": name, "answer": ans.get("answer", ""), "confidence": ans.get("confidence", 0),
+                 "reasoning": ans.get("reasoning", "")}
+                for name, ans in zip(
+                    ["preference_summarizer", "factual_recaller", "temporal_reasoner"],
+                    specialist_answers,
+                )
+            ],
+        }, ensure_ascii=False)
+
+        judge_response = await self.generate(prompts.DEBATE_JUDGE_SYSTEM, judge_input)
+        parsed = self._parse_json(judge_response)
+
+        if debug is not None:
+            debug.record("debate_answer", {
+                "specialist_answers": specialist_answers,
+                "judge_raw": judge_response,
+                "judge_parsed": parsed,
             })
         return parsed
 

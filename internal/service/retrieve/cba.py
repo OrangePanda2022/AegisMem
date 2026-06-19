@@ -103,8 +103,10 @@ class CBAService:
                 orig_truncated = _truncate_by_tokens(fact.original_msg, orig_budget)
                 orig_str = f"\n  original_msg: {orig_truncated}"
 
+            has_pref = bool(fact.metadata and fact.metadata.Preference)
+            pref_tag = " [偏好]" if has_pref else ""
             parts.append(
-                f"- [{ts}] fact: {truncated}{tags_str}{meta_str}{orig_str}"
+                f"- [{ts}]{pref_tag} fact: {truncated}{tags_str}{meta_str}{orig_str}"
             )
 
         if dialog_buffer and dialog_buffer.size > 0:
