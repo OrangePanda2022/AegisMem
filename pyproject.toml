@@ -13,6 +13,4 @@ dependencies = [
     "openai>=2.41.0",
     "pydantic-settings>=2.14.1",
     "sqlite-vec>=0.1.9",
-    "textual>=0.70.0",
-    "tqdm>=4.68.2",
 ]

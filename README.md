@@ -253,8 +253,6 @@ scripts/
 - `pydantic-settings` — 配置管理
 - `numpy` — 向量运算
 - `json-repair` — 容错 JSON 解析
-- `textual` — TUI
-- `tqdm` — 进度条
 
 ## 参考
 
